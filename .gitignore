@@ -1,0 +1,43 @@
+# ---- Python caches / runtime ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.db
+
+# ---- Node / frontend ----
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- PRD ----
+design/*_prd.md
+
+# ---- LLM / agent tooling ----
+.omc/
+.claude/
+CLAUDE.md
+AGENTS.md
+pdf_llp.md
+
+# ---- PDF ----
+*.pdf
+
+# ---- OS / editor ----
+.DS_Store
+.vscode/
+.idea/
+*.swp
