@@ -1,5 +1,14 @@
 # LLP — Label Lake Pipeline
 
+[![Repo](https://img.shields.io/badge/GitHub-jcyeom%2FLabelLakePipeline-181717?logo=github&logoColor=white)](https://github.com/jcyeom/LabelLakePipeline)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-Pydantic%20v2-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-18%20%2B%20TypeScript-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Vite](https://img.shields.io/badge/Vite-build-646CFF?logo=vite&logoColor=white)](https://vitejs.dev/)
+[![Tests](https://img.shields.io/badge/tests-212%20passing-brightgreen)](backend/tests)
+
+저장소: https://github.com/jcyeom/LabelLakePipeline
+
 약지도 학습(weak supervision) 라벨을 데이터 레이크 안에서 일급 객체(Label Object)로
 저장, 합의, 검증, 추적하는 라벨 관리 파이프라인이다.
 
@@ -159,6 +168,113 @@ npm install
 cp .env.example .env          # 백엔드가 다른 곳이면 VITE_PROXY_TARGET 조정
 npm run dev                   # http://localhost:5173 (/api -> backend :8000 프록시)
 ```
+
+---
+
+## 데이터 레이크
+
+> 구현 현황: MVP는 영구 데이터를 단일 SQLite(`backend/llp.db`)에 저장하고, 레이크 경로
+> `lake://<layer>/...`는 재현용 URI 문자열로 DB 컬럼에만 기록한다(`docs/STORAGE.md`).
+> 아래는 그 `lake://` URI를 실제 객체 스토어로 해석하는 **프로덕션 레이크 구성**으로,
+> Object Store(MinIO/S3) + Apache Iceberg + DuckDB를 정본으로 한다. 표의 각 항목은
+> [구현]과 [설계]로 구분한다.
+
+### 설치 및 구성
+
+MVP는 별도 레이크 설치 없이 동작한다(SQLite만 사용). 객체 스토어를 붙일 때는 MinIO를
+S3 호환 엔드포인트로 띄우고 환경변수로 연결한다.
+
+```bash
+# 1) MinIO(S3 호환) 기동 — 로컬 단일 노드
+docker run -d --name llp-lake -p 9000:9000 -p 9001:9001 \
+  -e MINIO_ROOT_USER=llp -e MINIO_ROOT_PASSWORD=llp-secret \
+  -v llp-lake-data:/data quay.io/minio/minio server /data --console-address ":9001"
+
+# 2) 계층별 버킷 생성 (mc = MinIO client)
+mc alias set lake http://127.0.0.1:9000 llp llp-secret
+mc mb lake/llp-bronze lake/llp-silver lake/llp-gold
+
+# 3) DuckDB는 backend/requirements.txt 에 포함 — 레이크 조인 쿼리 엔진(httpfs+parquet)
+```
+
+레이크 연결 환경변수(`backend/.env` 또는 셸 export, prefix `LLP_`):
+
+| 환경변수 | 예시 | 의미 |
+| --- | --- | --- |
+| `LLP_LAKE_ROOT` | `s3://llp` | 레이크 루트. `<root>-<layer>` 또는 `<root>/<layer>` 규칙으로 계층 버킷 매핑 |
+| `LLP_LAKE_ENDPOINT` | `http://127.0.0.1:9000` | S3 호환 엔드포인트(MinIO) |
+| `LLP_LAKE_ACCESS_KEY` | `llp` | 액세스 키 |
+| `LLP_LAKE_SECRET_KEY` | `llp-secret` | 시크릿 키 |
+| `LLP_LAKE_REGION` | `us-east-1` | 리전(S3 SDK 요구값) |
+| `LLP_LAKE_FORMAT` | `iceberg` | 적재 포맷(`parquet` 또는 `iceberg`) |
+
+> 현재 코드에서 사용하는 레이크 설정은 `LLP_LAKE_ROOT` 하나이며(`backend/app/config.py`의
+> `Settings.lake_root`, 기본 `lake://`), 나머지 키는 객체 스토어 적재를 켤 때 추가되는
+> [설계] 항목이다.
+
+### 배치(계층 레이아웃)
+
+레이크 경로 규칙은 `lake://<layer>/<table>/<partition>/...`이다.
+
+```
+s3://llp-bronze/                              [설계] 원천/수집 데이터(불변 랜딩 존)
+  raw/{source}/dt=YYYY-MM-DD/part-*.parquet
+
+s3://llp-silver/                              L1 후보 + 정제 feature
+  labels_l1_candidate/dt=YYYY-MM-DD/method={rule|llm|human}/part-*.parquet
+  features/{dataset}/dt=YYYY-MM-DD/part-*.parquet
+
+s3://llp-gold/                                L2/L3 + dataset manifest
+  labels_l2_consensus/version={gold_ver}/part-*.parquet
+  labels_l3_gold/version={gold_ver}/part-*.parquet
+  dataset_manifest/{dataset_id}/manifest.json
+```
+
+파티션 키는 수집일(`dt`)과 라벨러(`method`), Gold는 재발행 버전(`version`)이다. 이는
+DB 테이블의 레이크 계층 매핑(`docs/STORAGE.md` §2.2)과 1:1로 대응한다.
+
+### Bronze / Silver / Gold 격리
+
+계층은 단순 디렉터리 prefix가 아니라 **버킷·권한·불변식 수준에서 격리**한다.
+
+| 계층 | 버킷 | 쓰기 주체 | 접근 정책 | 불변식 |
+| --- | --- | --- | --- | --- |
+| Bronze | `llp-bronze` | 수집기(ingest)만 | 파이프라인 외부 read 차단 | 랜딩 후 불변(overwrite 금지) |
+| Silver | `llp-silver` | LabelerAdapter / pipeline | DataEngineer write, MLEngineer read | **append-only**(수정·삭제 금지, 정정은 새 `run_id`로 재append 후 기존 row `SUPERSEDED`) |
+| Gold | `llp-gold` | FusionEngine / ReviewSvc / GoldRepublisher | Admin write, Viewer read | **버전 보존**(L2/L3 재발행 시 이전 버전 유지, rollback 가능) |
+
+격리 시행 방법:
+
+- 버킷 분리 + IAM/버킷 정책으로 계층 간 교차 쓰기를 원천 차단(Bronze는 ingest 역할만,
+  Gold는 Admin 역할만 write).
+- Silver append-only는 객체 버전관리(S3 Versioning) + Iceberg `append` 전용 트랜잭션으로
+  강제하고, Postgres에서는 트리거로 보강한다(MVP는 애플리케이션 계층에서 보장,
+  `docs/STORAGE.md` §2.3).
+- API 권한(`require_role`)과 레이크 정책을 이중으로 맞춰 코드 경로와 스토리지 경로가
+  같은 RBAC를 따르게 한다.
+
+### 데이터 이동 방법 및 함수
+
+계층 간 이동은 임의 복사가 아니라 **승격(promotion) 트랜잭션**으로만 일어난다. 각 승격은
+audit_log에 기록되고 lineage로 추적된다. 레이크 어댑터(`app/services/lake.py`, [설계])가
+다음 함수를 노출한다.
+
+| 이동 | 함수 | 트리거 | 동작 |
+| --- | --- | --- | --- |
+| Bronze→Silver | `ingest_features(source, dt) -> run_id` | 수집 배치 | 원천을 정제 feature로 적재, `inputs_hash` 산출 |
+| →Silver(L1) | `write_l1_candidate(label_obj) -> label_id` | LabelerAdapter | L1 후보 append-only 적재(method 파티션) |
+| Silver→Gold(L2) | `promote_l2(sample_ids, policy) -> gold_ver` | `POST /api/v1/fusion/run` | 합의 통과분만 Gold L2로 승격, 불일치는 검수 큐로 |
+| Gold(L3) | `promote_l3(review_id) -> label_id` | `POST /api/v1/reviews/{id}/complete` | 검수 통과 L3 발행, 이전 활성 L3 `superseded` |
+| Gold republish | `republish_gold(reason) -> gold_ver` | `POST /api/v1/gold/republish` | 정책/버전 변경 시 L2 재발행, 이전 버전 보존 |
+| Gold→Dataset | `build_dataset(level, filters) -> manifest_uri` | `POST /api/v1/datasets/build` | L2/L3/L3_PRIORITY를 결합해 재현 가능한 manifest 산출 |
+
+이동 규약:
+
+- 모든 승격은 단방향(Bronze→Silver→Gold)이며 하위 계층을 역방향으로 수정하지 않는다.
+- 승격은 멱등(idempotent)하게 설계한다 — 같은 `run_id`/입력 해시면 중복 적재하지 않는다.
+- feature↔label 조인은 DuckDB(MVP) → Trino/Spark(V1)로 수행하며, 결과만 Gold에 쓴다.
+- 현재 MVP에서 위 함수들의 효과는 SQLite 테이블 쓰기 + `lake://` URI 기록으로 구현되어
+  있고, 객체 스토어 실제 입출력은 위 환경변수를 설정하면 활성화되는 [설계] 델타다.
 
 ---
 
