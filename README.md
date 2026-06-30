@@ -179,6 +179,48 @@ npm run dev                   # http://localhost:5173 (/api -> backend :8000 프
 > Object Store(MinIO/S3) + Apache Iceberg + DuckDB를 정본으로 한다. 표의 각 항목은
 > [구현]과 [설계]로 구분한다.
 
+### 한눈에 보기
+
+계층은 버킷·권한·불변식으로 격리되고, 데이터는 단방향 승격(promotion) 함수로만 이동한다.
+
+```
+   원천 데이터
+      |
+      |  ingest_features(source, dt)            [Bronze write = ingest 역할]
+      v
++----------------------+        s3://llp-bronze/  (불변 랜딩 존, overwrite 금지)
+|  BRONZE  원천/수집    |        raw/{source}/dt=.../part-*.parquet
++----------------------+
+      |
+      |  write_l1_candidate(label_obj)          [Silver write = DataEngineer]
+      |   rule / llm / human 라벨러 → L1 후보
+      v
++----------------------+        s3://llp-silver/  (append-only · 수정/삭제 금지)
+|  SILVER  L1 + feature |        labels_l1_candidate/dt=.../method={rule|llm|human}/
+|                      |        features/{dataset}/dt=.../
++----------------------+
+      |
+      |  promote_l2(sample_ids, policy)         [Gold L2 write = DataEngineer]
+      |   Fusion 합의 통과분만 승격 ── 불일치 ──> Human Review Queue
+      |                                              |
+      |                          promote_l3(review_id)  [Gold L3 write = Reviewer]
+      v                                              v
++--------------------------------------------------------------+
+|  GOLD  L2 합의 / L3 검증 / dataset manifest  (버전 보존·rollback) |
+|        s3://llp-gold/                                          |
+|          labels_l2_consensus/version={gold_ver}/              |
+|          labels_l3_gold/version={gold_ver}/                   |
+|          dataset_manifest/{dataset_id}/manifest.json          |
++--------------------------------------------------------------+
+      |                                   ^
+      |  build_dataset(level, filters)    |  republish_gold(reason)  [Admin]
+      v                                   |  정책/버전 변경 시 L2 재발행(이전 버전 유지)
+   학습 Dataset (manifest_uri)  ──────────+
+```
+
+각 화살표 옆 함수는 아래 "데이터 이동 방법 및 함수" 표의 승격 함수이며, 모든 이동은
+audit_log에 기록되어 lineage로 추적된다.
+
 ### 설치 및 구성
 
 MVP는 별도 레이크 설치 없이 동작한다(SQLite만 사용). 객체 스토어를 붙일 때는 MinIO를
